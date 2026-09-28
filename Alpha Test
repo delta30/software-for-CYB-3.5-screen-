@@ -1,0 +1,126 @@
+void paint() {
+  if (screen==HOME) drawHome();
+  else if (screen==WIFI_SCAN) drawWifi();
+  else if (screen==STOPWATCH) drawStopwatch();
+  else if (screen==ABOUT) drawAbout();
+  else drawStats();
+  lastPaint=millis();
+}
+
+void startScan() {
+  WiFi.mode(WIFI_STA); WiFi.disconnect(false, false); delay(30);
+  WiFi.scanDelete(); WiFi.scanNetworks(true, true, true, 300);
+  scanMessage="Scanning...";
+}
+
+String uploadSurvey() {
+  if (!sdReady) return "Insert FAT microSD with survey.csv";
+  if (!strlen(WIFI_SSID)) return "Set Wi-Fi SSID/password in sketch";
+  File keyFile=SD.open("/wdg_key.txt",FILE_READ);
+  File caFile=SD.open("/isrgrootx1.pem",FILE_READ);
+  if(!keyFile || !caFile) { if(keyFile)keyFile.close(); if(caFile)caFile.close(); return "SD needs wdg_key.txt + isrgrootx1.pem"; }
+  String apiKey=keyFile.readString(); apiKey.trim(); keyFile.close();
+  String ca=caFile.readString(); caFile.close();
+  if(apiKey.length()!=64) return "API key must be 64 characters";
+  if(!SD.exists("/survey.csv")) return "No survey file to upload";
+  WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
+  uint32_t waitStart=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-waitStart<15000) delay(250);
+  if(WiFi.status()!=WL_CONNECTED) return "Wi-Fi connection failed";
+  File data=SD.open("/survey.csv",FILE_READ); if(!data) return "Cannot open survey.csv";
+  WiFiClientSecure client; client.setCACert(ca.c_str()); client.setTimeout(20000);
+  if(!client.connect("wdgwars.pl",443)) { data.close(); return "TLS connection failed; check CA file"; }
+  String boundary="----CYDForm"+String((uint32_t)esp_random(),HEX);
+  String pre="--"+boundary+"\r\nContent-Disposition: form-data; name=\"file\"; filename=\"survey.csv\"\r\nContent-Type: text/csv\r\n\r\n";
+  String post="\r\n--"+boundary+"--\r\n";
+  uint32_t length=pre.length()+data.size()+post.length();
+  client.printf("POST /api/upload-csv HTTP/1.1\r\nHost: wdgwars.pl\r\nX-API-Key: %s\r\nContent-Type: multipart/form-data; boundary=%s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",apiKey.c_str(),boundary.c_str(),(unsigned)length);
+  client.print(pre);
+  uint8_t buf[512]; while(data.available()) { size_t n=data.read(buf,sizeof(buf)); if(n) client.write(buf,n); }
+  client.print(post); data.close();
+  String status=client.readStringUntil('\n'); status.trim();
+  String response=""; uint32_t until=millis()+10000;
+  while(client.connected() && millis()<until) { while(client.available()) { char c=client.read(); if(response.length()<180) response+=c; } delay(5); }
+  client.stop();
+  if(status.indexOf(" 200 ")>=0 || status.indexOf(" 201 ")>=0 || status.indexOf(" 202 ")>=0)
+    return "WDGWars accepted upload ("+status+")";
+  return "Upload response: "+status;
+}
+
+void onTap(int x, int y) {
+  if (screen==HOME) {
+    if (pressed(14,151,139,34,x,y)) { screen=WIFI_SCAN; startScan(); }
+    else if (pressed(167,151,139,34,x,y)) screen=STOPWATCH;
+    else if (pressed(14,195,139,30,x,y)) screen=ABOUT;
+    else if (pressed(167,195,139,30,x,y)) screen=SURVEY_STATS;
+  } else if (screen==WIFI_SCAN) {
+    if (pressed(128,50,82,30,x,y)) startScan();
+    else if (pressed(216,50,90,30,x,y)) { uploadMessage=uploadSurvey(); }
+    else if (pressed(14,211,292,24,x,y)) screen=HOME;
+  } else if (screen==STOPWATCH) {
+    if (pressed(14,158,139,38,x,y)) {
+      if (swRunning) { swAccumulated += millis()-swStarted; swRunning=false; }
+      else { swStarted=millis(); swRunning=true; }
+    } else if (pressed(167,158,139,38,x,y)) { swAccumulated=0; if (swRunning) swStarted=millis(); }
+    else if (pressed(14,205,292,28,x,y)) screen=HOME;
+  } else if (screen==ABOUT && pressed(14,195,292,30,x,y)) screen=HOME;
+  else if (screen==SURVEY_STATS && pressed(14,215,292,22,x,y)) screen=HOME;
+  paint();
+}
+
+void setup() {
+  Serial.begin(115200);
+  tft.init(); tft.setRotation(1); tft.fillScreen(bg);
+  touchSPI.begin(25, 39, 32, TOUCH_CS);
+  touch.begin(touchSPI); touch.setRotation(1);
+  if (GPS_ENABLED) gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  SPI.begin(18, 19, 23, SD_CS);
+  sdReady = SD.begin(SD_CS, SPI);
+  if (sdReady && !SD.exists("/survey.csv")) {
+    File f=SD.open("/survey.csv", FILE_WRITE);
+    if(f){ f.println("WigleWifi-1.6,appRelease=1.0,model=ESP32,device=CYD,board=ESP32-3248S035R,brand=CYD"); f.println("MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type"); f.close(); }
+  }
+  WiFi.mode(WIFI_STA);
+  if (strlen(WIFI_SSID) > 0) WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  paint();
+}
+
+void loop() {
+  while (GPS_ENABLED && gpsSerial.available()) gps.encode(gpsSerial.read());
+  int x,y;
+  if (getTouch(x,y)) {
+    onTap(x,y);
+    while (touch.touched()) delay(10);
+    delay(100);
+  }
+  if (screen==WIFI_SCAN && WiFi.scanComplete()>=0 && scanMessage=="Scanning...") {
+    int n=WiFi.scanComplete();
+    lastNetworkCount=n; lastStrongest=-127; scanCount++;
+    memset(channelCounts,0,sizeof(channelCounts));
+    for(int i=0;i<n;i++) {
+      int ch=WiFi.channel(i), rssi=WiFi.RSSI(i);
+      if(ch>=1 && ch<=13) channelCounts[ch]++;
+      if(rssi>lastStrongest) lastStrongest=rssi;
+      if(sdReady) {
+        File f=SD.open("/survey.csv",FILE_APPEND);
+        if(f) {
+          time_t stamp=time(nullptr); struct tm ti; char seen[24]="1970-01-01 00:00:00";
+          if(stamp>1700000000 && localtime_r(&stamp,&ti)) strftime(seen,sizeof(seen),"%Y-%m-%d %H:%M:%S",&ti);
+          String ssid=WiFi.SSID(i); ssid.replace("\"","\"\"");
+          const char *auth="[ESS]"; wifi_auth_mode_t enc=WiFi.encryptionType(i);
+          if(enc==WIFI_AUTH_WEP) auth="[WEP]"; else if(enc==WIFI_AUTH_WPA_PSK) auth="[WPA_PSK]";
+          else if(enc==WIFI_AUTH_WPA2_PSK) auth="[WPA2_PSK]"; else if(enc==WIFI_AUTH_WPA_WPA2_PSK) auth="[WPA_WPA2_PSK]";
+          else if(enc!=WIFI_AUTH_OPEN) auth="[WPA2_PSK]";
+          int freq=(ch<=13)?2407+ch*5:5000+ch*5;
+          f.printf("%s,\"%s\",%s,%s,%d,%d,%d,",WiFi.BSSIDstr(i).c_str(),ssid.c_str(),auth,seen,ch,freq,rssi);
+          if(GPS_ENABLED && gps.location.isValid()) f.printf("%.6f,%.6f,%.1f,%.1f,,,0,WIFI\n",gps.location.lat(),gps.location.lng(),gps.altitude.isValid()?gps.altitude.meters():0.0,gps.hdop.isValid()?gps.hdop.hdop()*5:0.0);
+          else f.println(",,,,,0,WIFI");
+          f.close();
+        }
+      }
+    }
+    scanMessage="Scan complete"; paint();
+  }
+  uint32_t interval = screen==HOME ? 1000 : (screen==STOPWATCH && swRunning ? 50 : 1000);
+  if (millis()-lastPaint >= interval) paint();
+}
